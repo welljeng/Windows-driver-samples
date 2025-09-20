@@ -6,6 +6,121 @@
 #ifdef MF_WPP
 #include "AvsCameraDMFT.tmh"    //--REF_ANALYZER_DONT_REMOVE--
 #endif
+
+#include <iostream>
+#include <fstream>
+#include <mutex>
+#include <string>
+#include <iomanip>
+#include <sstream>
+
+const std::string LOG_FILE_NAME = "C:\\Temp\\AvsCameraDMFT_log.txt";
+
+// TODO: required to avoid bug OS bug 36971659 in extended property handling that introduces a 16 bytes cookie
+typedef struct
+{
+    //byte cookieBuffer[16];
+    KSCAMERA_EXTENDEDPROP_HEADER header;
+} KSCAMERA_EXTENDEDPROP_HEADER_BUFFERED, * PKSCAMERA_EXTENDEDPROP_HEADER_BUFFERED;
+
+
+void putLog(const std::string& content, bool append = true) 
+{
+    static std::mutex logMutex;
+    std::lock_guard<std::mutex> lock(logMutex);
+
+    std::time_t t = std::time(nullptr);
+    std::tm tm;
+    localtime_s(&tm, &t);
+
+    std::ofstream outfile;
+    if (append)
+        outfile.open(LOG_FILE_NAME, std::ios_base::app);
+    else {
+        outfile.open(LOG_FILE_NAME);
+        outfile << std::put_time(&tm, "%c %Z") << ": New log created." << std::endl;
+    }
+    outfile << std::put_time(&tm, "%c %Z")<< ": " << content << std::endl;
+}
+
+void putLog(const std::wstring& content, bool append = true)
+{
+    _bstr_t b(content.c_str());
+    const char* c = b;
+    putLog(c, append);
+}
+
+HRESULT CMultipinMft::ProfilePropertyHandler(
+    _In_reads_bytes_(ulPropertyLength) PKSPROPERTY pProperty,
+    _In_       ULONG       ulPropertyLength,
+    _In_       LPVOID      pPropertyData,
+    _In_       ULONG       ulDataLength,
+    _Inout_    PULONG      pulBytesReturned)
+{
+    UNREFERENCED_PARAMETER(ulPropertyLength);
+    HRESULT hr = S_OK;
+    if (pProperty->Flags & KSPROPERTY_TYPE_SET)
+    {
+        putLog("ProfilePropertyHandler handling KSPROPERTY_TYPE_SET");
+        DMFTCHECKNULL_GOTO(pulBytesReturned, done, E_POINTER);
+        *pulBytesReturned = sizeof(KSCAMERA_EXTENDEDPROP_HEADER_BUFFERED) + sizeof(KSCAMERA_EXTENDEDPROP_PROFILE);
+        if (ulDataLength < *pulBytesReturned)
+        {
+            putLog("ProfilePropertyHandler Error ulDataLength ("+ std::to_string(ulDataLength) +") < *pulBytesReturned (" + std::to_string(*pulBytesReturned) + ")");
+            return HRESULT_FROM_WIN32(ERROR_MORE_DATA);
+        }
+        else if (pPropertyData)
+        {
+            PBYTE pPayload = (PBYTE)pPropertyData;
+            PKSCAMERA_EXTENDEDPROP_HEADER pExtendedHeader = &((PKSCAMERA_EXTENDEDPROP_HEADER_BUFFERED)pPayload)->header;
+            KSCAMERA_EXTENDEDPROP_PROFILE* pProfile = (PKSCAMERA_EXTENDEDPROP_PROFILE)(pExtendedHeader + 1);
+
+            OLECHAR* guidString;
+            StringFromCLSID(pProfile->ProfileId, &guidString);
+            putLog("ProfilePropertyHandler handling KSPROPERTY_TYPE_SET ProfileId: ");
+            putLog(guidString);
+            if (pProfile->ProfileId == KSCAMERAPROFILE_FaceAuth_Mode)
+            {
+                putLog("ProfilePropertyHandler handling KSPROPERTY_TYPE_SET -> KSCAMERAPROFILE_FaceAuth_Mode.");
+                m_isFaceAuthMode = true;
+            }
+        }
+    }
+    else if (pProperty->Flags & KSPROPERTY_TYPE_GET)
+    {
+        putLog("ProfilePropertyHandler handling KSPROPERTY_TYPE_GET");
+        DMFTCHECKNULL_GOTO(pulBytesReturned, done, E_POINTER);
+        *pulBytesReturned = sizeof(KSCAMERA_EXTENDEDPROP_HEADER_BUFFERED) + sizeof(KSCAMERA_EXTENDEDPROP_PROFILE);
+        if (ulDataLength < *pulBytesReturned)
+        {
+            putLog("ProfilePropertyHandler Error ulDataLength (" + std::to_string(ulDataLength) + ") < *pulBytesReturned (" + std::to_string(*pulBytesReturned) + ")");
+            return HRESULT_FROM_WIN32(ERROR_MORE_DATA);
+        }
+        else if (pPropertyData)
+        {
+            PBYTE pPayload = (PBYTE)pPropertyData;
+            PKSCAMERA_EXTENDEDPROP_HEADER pExtendedHeader = &((PKSCAMERA_EXTENDEDPROP_HEADER_BUFFERED)pPayload)->header;
+            KSCAMERA_EXTENDEDPROP_PROFILE* pProfile = (PKSCAMERA_EXTENDEDPROP_PROFILE)(pExtendedHeader + 1);
+            
+            OLECHAR* guidString;
+            StringFromCLSID(pProfile->ProfileId, &guidString);
+            putLog("ProfilePropertyHandler handling KSPROPERTY_TYPE_GET ProfileId: ");
+            putLog(guidString);
+            if (pProfile->ProfileId == KSCAMERAPROFILE_FaceAuth_Mode)
+            {
+                putLog("ProfilePropertyHandler handling KSPROPERTY_TYPE_GET -> KSCAMERAPROFILE_FaceAuth_Mode.");
+            }
+        }
+    }
+    else
+    {
+        putLog("ProfilePropertyHandler handling Unknown!!!");
+    }
+done:
+        return hr;
+}
+
+
 //
 // This DeviceMFT is a stripped down implementation of the device MFT Sample present in the sample Repo
 // The original DMFT is present at https://github.com/microsoft/Windows-driver-samples/tree/main/avstream/sampledevicemft
@@ -21,6 +136,7 @@ CMultipinMft::CMultipinMft()
     m_SymbolicLink(nullptr)
 
 {
+	putLog("CMultipinMft::CMultipinMft initialiing\n", false);
     HRESULT hr = S_OK;
     ComPtr<IMFAttributes> pAttributes = nullptr;
     MFCreateAttributes( &pAttributes, 0 );
@@ -637,7 +753,30 @@ IFACEMETHODIMP  CMultipinMft::ProcessInput(
     {
         goto done;
     }
-
+    if (pSample != nullptr && !m_isFaceAuthMode.value_or(false))
+    {
+        IMFMediaBuffer* pMediaBuff{ nullptr };
+        hr = pSample->ConvertToContiguousBuffer(&pMediaBuff);
+        if (SUCCEEDED(hr))
+        {
+            DWORD bufferSize = 0;
+            BYTE* pBuffer = nullptr;
+            hr = pMediaBuff->Lock(&pBuffer, nullptr, &bufferSize);
+            if (SUCCEEDED(hr))
+            {
+                // Process the buffer here
+                int start = bufferSize / 2;
+				memset(pBuffer+start, 0xAB, bufferSize - start); // Example processing: flip 2nd half of image buffer into 0xAB
+                //memset(pBuffer, 0xAB, bufferSize); // Example processing: flip 2nd half of image buffer into 0xAB
+                hr = pMediaBuff->Unlock();
+				putLog("CMultipinMft::ProcessInput Processed a sample buffer.");
+            }
+		}
+    }
+    if (m_isFaceAuthMode.value_or(false))
+    {
+        putLog("CMultipinMft::ProcessInput filter skipped due to FaceAuth_Mode.");
+    }
     DMFTCHECKHR_GOTO(spInPin->SendSample( pSample ), done );
 done:
     DMFTRACE( DMFT_GENERAL, TRACE_LEVEL_INFORMATION, "%!FUNC! exiting %x = %!HRESULT!", hr, hr );
@@ -990,13 +1129,60 @@ IFACEMETHODIMP CMultipinMft::KsProperty(
     --*/
 {
     HRESULT hr = S_OK;
-    
-    DMFTCHECKHR_GOTO(m_spIkscontrol->KsProperty(pProperty,
-        ulPropertyLength,
-        pvPropertyData,
-        ulDataLength,
-        pulBytesReturned),done);
+	putLog("CMultipinMft::KsProperty: entering");
+
+    /// PDMFT only cares about ExtendedCameraControls, all others 
+    /// are just blindly forwarded to the upstream DMFTs. 
+    if (!IsEqualCLSID(pProperty->Set, KSPROPERTYSETID_ExtendedCameraControl))
+    {
+        putLog("CMultipinMft::KsProperty: not receiving KSPROPERTYSETID_ExtendedCameraControl .");
+        DMFTCHECKHR_GOTO(m_spIkscontrol->KsProperty(pProperty, ulPropertyLength, pvPropertyData, 
+            ulDataLength, pulBytesReturned), done);
+        goto done;
+    }
+    putLog("CMultipinMft::KsProperty: receiving KSPROPERTYSETID_ExtendedCameraControl, Id = "+ std::to_string(pProperty->Id));
+    switch (pProperty->Id)
+    {
+        case KSPROPERTY_CAMERACONTROL_EXTENDED_SECURE_MODE:
+        {
+            if ((pProperty->Flags & KSPROPERTY_TYPE_SET) &&
+                pvPropertyData != nullptr &&
+                ulDataLength >= (sizeof(KSCAMERA_EXTENDEDPROP_HEADER) + sizeof(KSCAMERA_EXTENDEDPROP_VALUE)))
+            {
+                const std::string securedMode = ((KSCAMERA_EXTENDEDPROP_HEADER*)(pvPropertyData))->Flags == KSCAMERA_EXTENDEDPROP_SECUREMODE_ENABLED ? "disabled" : "enabled";
+                putLog("CMultipinMft::KsProperty: KSPROPERTY_CAMERACONTROL_EXTENDED_SECURE_MODE: " + securedMode);
+
+                /*
+                /// InternalFindPinById() will return an invalid stream number 
+                /// failure if the stream id doesn't exist in our collection. 
+                /// So use it as a way to validate the input stream id in the 
+                /// extended property header. 
+                wil::com_ptr_nothrow<PlatformDMFTPin> spPin;
+                CHECKHR_GOTO_LEVEL(InternalFindPinById(((KSCAMERA_EXTENDEDPROP_HEADER*)(pvPropertyData))->PinId, &spPin), done, TP_ERROR);
+                if (((KSCAMERA_EXTENDEDPROP_HEADER*)(data))->Flags == KSCAMERA_EXTENDEDPROP_SECUREMODE_ENABLED)
+                {
+                    m_spConfig->SetSecureModeStreamId(((KSCAMERA_EXTENDEDPROP_HEADER*)(pvPropertyData))->PinId);
+                }
+                */
+            }
+        }
+        case KSPROPERTY_CAMERACONTROL_EXTENDED_PROFILE:
+        {
+            putLog("CMultipinMft::KsProperty: KSPROPERTY_CAMERACONTROL_EXTENDED_PROFILE");
+            ProfilePropertyHandler(pProperty, ulPropertyLength, pvPropertyData, ulDataLength, pulBytesReturned);
+            /*
+            if ((pProperty->Flags & KSPROPERTY_TYPE_SET) &&
+                pvPropertyData != nullptr &&
+                ulDataLength >= (sizeof(KSCAMERA_EXTENDEDPROP_HEADER) + sizeof(KSCAMERA_EXTENDEDPROP_VALUE)))
+            {
+                const std::string securedMode = ((KSCAMERA_EXTENDEDPROP_HEADER*)(pvPropertyData))->
+            }
+            */
+        }
+
+    }
 done:
+    putLog("CMultipinMft::KsProperty: Done.");
     return hr;
 }
 
@@ -1041,12 +1227,57 @@ IFACEMETHODIMP CMultipinMft::KsEvent(
 {
 
     HRESULT hr = S_OK;
-    // Handle the events here if you want, This sample passes the events to the driver
-    DMFTCHECKHR_GOTO(m_spIkscontrol->KsEvent(pEvent,
-        ulEventLength,
-        pEventData,
-        ulDataLength,
-        pBytesReturned), done);
+    putLog("CMultipinMft::KsEvent event id = " + std::to_string(pEvent->Id));
+
+    // handle the event if it is to set profile or ROI for ISP
+    if (pEvent != nullptr
+        && ulEventLength >= sizeof(KSEVENT)
+        && pEvent->Set == KSEVENTSETID_ExtendedCameraControl
+        && pEventData != nullptr
+        && ulDataLength >= sizeof(KSEVENTDATA)
+        && (pEvent->Id == KSPROPERTY_CAMERACONTROL_EXTENDED_PROFILE))
+    {
+        putLog("CMultipinMft::KsEvent handling KSPROPERTY_CAMERACONTROL_EXTENDED_PROFILE event");
+        
+        m_hSelectedProfileKSEvent.reset();
+        RETURN_IF_WIN32_BOOL_FALSE(DuplicateHandle(
+            GetCurrentProcess(),
+            ((KSEVENTDATA*)(pEventData))->EventHandle.Event,
+            GetCurrentProcess(),
+            &m_hSelectedProfileKSEvent,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS));
+
+        if (m_isProfileDDISupportedInBaseDriver.value_or(true))
+        {
+            RETURN_IF_FAILED(m_hSelectedProfileKSEventSentToDriver.create());
+            KSEVENTDATA driverEventData = {};
+            driverEventData.NotificationType = KSEVENTF_EVENT_HANDLE;
+            driverEventData.EventHandle.Event = m_hSelectedProfileKSEventSentToDriver.get();
+            std::stringstream ss;
+            ss << static_cast<void*>(m_hSelectedProfileKSEventSentToDriver.get());
+            putLog("Handling profile set KsEvent, created profile KsEvent handle for driver: " +ss.str());
+
+            // defer to source device
+            hr = m_spIkscontrol->KsEvent(pEvent, ulEventLength, (void*)(&driverEventData), ulDataLength, pBytesReturned);
+            if (FAILED(hr))
+            {
+                ss << "Failed to send profile KsEvent handle to driver: " << static_cast<void*>(m_hSelectedProfileKSEventSentToDriver.get()) << "| hr = " << hr;
+                putLog(ss.str());
+                m_hSelectedProfileKSEventSentToDriver.reset();
+                m_isProfileDDISupportedInBaseDriver = false;
+            }
+        }
+    }
+    else {
+        // Handle the events here if you want, This sample passes the events to the driver
+        DMFTCHECKHR_GOTO(m_spIkscontrol->KsEvent(pEvent,
+            ulEventLength,
+            pEventData,
+            ulDataLength,
+            pBytesReturned), done);
+    }
 done:
     return hr;
 }

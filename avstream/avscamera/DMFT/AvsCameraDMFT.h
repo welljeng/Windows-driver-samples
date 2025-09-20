@@ -7,6 +7,11 @@
 #include "mftpeventgenerator.h"
 #include "basepin.h"
 
+//New Added.
+#include <wil/com.h>
+#include <wil/resource.h>
+#include <optional>
+
 //
 // The Below GUID is needed to transfer photoconfirmation sample successfully in the pipeline
 // It is used to propagate the mediatype of the sample to the pipeline which will consume the sample
@@ -320,8 +325,21 @@ private:
     UINT32                       m_punValue;
     ComPtr<IKsControl>           m_spIkscontrol;
     ComPtr<IMFAttributes>        m_spAttributes;
+	//ComPtr<IPlatformDMFTControlConfiguration> m_spPlatformControlConfig; // Platform control configuration interface
     map<int, int>                m_outputPinMap;                      // How output pins are connected to input pins i-><0..outpins>
     PWCHAR                       m_SymbolicLink;
+    wil::unique_event_nothrow m_hSelectedProfileKSEvent;
+    wil::unique_event_nothrow m_hSelectedProfileKSEventSentToDriver;
+    std::optional<bool> m_isProfileDDISupportedInBaseDriver;
+    std::optional<bool> m_isFaceAuthMode;
+
+    HRESULT ProfilePropertyHandler(
+        _In_reads_bytes_(ulPropertyLength) PKSPROPERTY pProperty,
+        _In_       ULONG       ulPropertyLength,
+        _Inout_updates_to_(ulDataLength, *pulBytesReturned) LPVOID pPropertyData,
+        _In_       ULONG       ulDataLength,
+        _Inout_    PULONG      pulBytesReturned);
+
 };
 
 
