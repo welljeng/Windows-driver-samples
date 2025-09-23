@@ -69,8 +69,9 @@ HRESULT CMultipinMft::ProfilePropertyHandler(
             putLog("ProfilePropertyHandler Error ulDataLength ("+ std::to_string(ulDataLength) +") < *pulBytesReturned (" + std::to_string(*pulBytesReturned) + ")");
             return HRESULT_FROM_WIN32(ERROR_MORE_DATA);
         }
-        else if (pPropertyData)
+        if (pPropertyData)
         {
+
             PBYTE pPayload = (PBYTE)pPropertyData;
             PKSCAMERA_EXTENDEDPROP_HEADER pExtendedHeader = &((PKSCAMERA_EXTENDEDPROP_HEADER_BUFFERED)pPayload)->header;
             KSCAMERA_EXTENDEDPROP_PROFILE* pProfile = (PKSCAMERA_EXTENDEDPROP_PROFILE)(pExtendedHeader + 1);
@@ -82,9 +83,50 @@ HRESULT CMultipinMft::ProfilePropertyHandler(
             if (pProfile->ProfileId == KSCAMERAPROFILE_FaceAuth_Mode)
             {
                 putLog("ProfilePropertyHandler handling KSPROPERTY_TYPE_SET -> KSCAMERAPROFILE_FaceAuth_Mode.");
-                m_isFaceAuthMode = true;
             }
+            m_selectedProfileId.Type = pProfile->ProfileId;
+			m_selectedProfileId.Index = pProfile->Index;
+			m_selectedProfileId.Unused = pProfile->Reserved;
+            // If the caller incorrectly sets GUID_NULL, just default back
+            // to legacy.
+            if (m_selectedProfileId.Type == GUID_NULL)
+            {
+                putLog("ProfilePropertyHandler KSPROPERTY_TYPE_SET: Caller set GUID_NULL, defaulting to KSCAMERAPROFILE_Legacy.");
+                m_selectedProfileId = { KSCAMERAPROFILE_Legacy, 0, 0 };
+			}
+
+            // signal we are done
+            if (m_hSelectedProfileKSEvent.get() != nullptr)
+            {
+                if (m_hSelectedProfileKSEventSentToDriver != nullptr)
+                {
+                    std::stringstream ss;
+					ss << static_cast<const void*>(m_hSelectedProfileKSEventSentToDriver.get());
+					putLog("Waiting for driver profile KsEvent handle: " + ss.str());
+                    //TRACE_LOG(WINEVENT_LEVEL_INFO, L"Waiting for driver profile KsEvent handle: %p", m_hSelectedProfileKSEventSentToDriver.get());
+                    if (!m_hSelectedProfileKSEventSentToDriver.wait(kMAX_WAIT_TIME_DRIVER_PROFILE_KSEVENT))
+                    {
+                        /*
+                        TRACE_LOG(WINEVENT_LEVEL_ERROR,
+                            L"Waiting for driver profile KsEvent handle: %p timed out after %i ms, failing",
+                            m_hSelectedProfileKSEventSentToDriver.get(),
+                            kMAX_WAIT_TIME_DRIVER_PROFILE_KSEVENT);
+                        m_hSelectedProfileKSEvent.SetEvent();
+                        */
+                        std::stringstream tt;
+                        tt << "Waiting for driver profile KsEvent handle : " << ss.str() << "timed out after "
+                            << std::to_string(kMAX_WAIT_TIME_DRIVER_PROFILE_KSEVENT) << " ms, failing";
+						putLog(tt.str());
+                        RETURN_IF_FAILED(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+                    }
+                    m_hSelectedProfileKSEventSentToDriver.reset();
+                }
+                m_hSelectedProfileKSEvent.SetEvent();
+                m_hSelectedProfileKSEvent.reset();
+            }
+
         }
+
     }
     else if (pProperty->Flags & KSPROPERTY_TYPE_GET)
     {
@@ -96,8 +138,15 @@ HRESULT CMultipinMft::ProfilePropertyHandler(
             putLog("ProfilePropertyHandler Error ulDataLength (" + std::to_string(ulDataLength) + ") < *pulBytesReturned (" + std::to_string(*pulBytesReturned) + ")");
             return HRESULT_FROM_WIN32(ERROR_MORE_DATA);
         }
-        else if (pPropertyData)
+        if (pPropertyData)
         {
+            if (!m_isProfileDDISupportedInBaseDriver.has_value())
+            {
+                hr = m_spIkscontrol->KsProperty(pProperty, ulPropertyLength, pPropertyData, ulDataLength, pulBytesReturned);
+                m_isProfileDDISupportedInBaseDriver = SUCCEEDED(hr);
+                //TRACE_LOG(WINEVENT_LEVEL_INFO, L"Profile DDI GET support on base driver: %d, hr=0x%08x", m_isProfileDDISupportedInBaseDriver.value(), hr);
+                *pulBytesReturned = sizeof(KSCAMERA_EXTENDEDPROP_HEADER_BUFFERED) + sizeof(KSCAMERA_EXTENDEDPROP_PROFILE);
+            }
             PBYTE pPayload = (PBYTE)pPropertyData;
             PKSCAMERA_EXTENDEDPROP_HEADER pExtendedHeader = &((PKSCAMERA_EXTENDEDPROP_HEADER_BUFFERED)pPayload)->header;
             KSCAMERA_EXTENDEDPROP_PROFILE* pProfile = (PKSCAMERA_EXTENDEDPROP_PROFILE)(pExtendedHeader + 1);
@@ -145,6 +194,7 @@ CMultipinMft::CMultipinMft()
     DMFTCHECKHR_GOTO(pAttributes->SetUINT32( MF_SA_D3D_AWARE, TRUE ), done);
     DMFTCHECKHR_GOTO(pAttributes->SetString( MFT_ENUM_HARDWARE_URL_Attribute, L"SampleMultiPinMft" ),done);
     m_spAttributes = pAttributes;
+    m_selectedProfileId = { KSCAMERAPROFILE_Legacy, 0, 0 };
 done:
     DMFTRACE(DMFT_GENERAL, TRACE_LEVEL_INFORMATION, "%!FUNC! exiting %x = %!HRESULT!", hr, hr);
 }
@@ -753,7 +803,7 @@ IFACEMETHODIMP  CMultipinMft::ProcessInput(
     {
         goto done;
     }
-    if (pSample != nullptr && !m_isFaceAuthMode.value_or(false))
+    if (pSample != nullptr && m_selectedProfileId.Type != KSCAMERAPROFILE_FaceAuth_Mode)
     {
         IMFMediaBuffer* pMediaBuff{ nullptr };
         hr = pSample->ConvertToContiguousBuffer(&pMediaBuff);
@@ -765,15 +815,15 @@ IFACEMETHODIMP  CMultipinMft::ProcessInput(
             if (SUCCEEDED(hr))
             {
                 // Process the buffer here
-                int start = bufferSize / 2;
-				memset(pBuffer+start, 0xAB, bufferSize - start); // Example processing: flip 2nd half of image buffer into 0xAB
-                //memset(pBuffer, 0xAB, bufferSize); // Example processing: flip 2nd half of image buffer into 0xAB
+                //int start = bufferSize / 2;
+				//memset(pBuffer+start, 0xAB, bufferSize - start); // Example processing: flip 2nd half of image buffer into 0xAB
+                memset(pBuffer, 0xAB, bufferSize); // Example processing: flip 2nd half of image buffer into 0xAB
                 hr = pMediaBuff->Unlock();
 				putLog("CMultipinMft::ProcessInput Processed a sample buffer.");
             }
 		}
     }
-    if (m_isFaceAuthMode.value_or(false))
+    if (m_selectedProfileId.Type == KSCAMERAPROFILE_FaceAuth_Mode)
     {
         putLog("CMultipinMft::ProcessInput filter skipped due to FaceAuth_Mode.");
     }
@@ -1226,10 +1276,10 @@ IFACEMETHODIMP CMultipinMft::KsEvent(
     --*/
 {
 
-    HRESULT hr = S_OK;
+    //HRESULT hr = S_OK;
     putLog("CMultipinMft::KsEvent event id = " + std::to_string(pEvent->Id));
 
-    // handle the event if it is to set profile or ROI for ISP
+    // handle the event if it is to set profile
     if (pEvent != nullptr
         && ulEventLength >= sizeof(KSEVENT)
         && pEvent->Set == KSEVENTSETID_ExtendedCameraControl
@@ -1260,7 +1310,7 @@ IFACEMETHODIMP CMultipinMft::KsEvent(
             putLog("Handling profile set KsEvent, created profile KsEvent handle for driver: " +ss.str());
 
             // defer to source device
-            hr = m_spIkscontrol->KsEvent(pEvent, ulEventLength, (void*)(&driverEventData), ulDataLength, pBytesReturned);
+            auto hr = m_spIkscontrol->KsEvent(pEvent, ulEventLength, (void*)(&driverEventData), ulDataLength, pBytesReturned);
             if (FAILED(hr))
             {
                 ss << "Failed to send profile KsEvent handle to driver: " << static_cast<void*>(m_hSelectedProfileKSEventSentToDriver.get()) << "| hr = " << hr;
@@ -1271,15 +1321,14 @@ IFACEMETHODIMP CMultipinMft::KsEvent(
         }
     }
     else {
-        // Handle the events here if you want, This sample passes the events to the driver
-        DMFTCHECKHR_GOTO(m_spIkscontrol->KsEvent(pEvent,
+        // Pass the events to the driver
+        RETURN_IF_FAILED(m_spIkscontrol->KsEvent(pEvent,
             ulEventLength,
             pEventData,
             ulDataLength,
-            pBytesReturned), done);
+            pBytesReturned));
     }
-done:
-    return hr;
+    return S_OK;
 }
 
 //

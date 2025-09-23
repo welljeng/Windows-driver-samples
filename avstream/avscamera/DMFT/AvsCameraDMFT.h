@@ -24,6 +24,8 @@ DEFINE_GUID(MFSourceReader_SampleAttribute_MediaType_priv,
 
 interface IDirect3DDeviceManager9;
 
+constexpr int kMAX_WAIT_TIME_DRIVER_PROFILE_KSEVENT = 3000;// ms, amount of time to wait for the profile DDI KsEvent sent to the driver
+
 //
 // Forward declarations
 //
@@ -331,7 +333,7 @@ private:
     wil::unique_event_nothrow m_hSelectedProfileKSEvent;
     wil::unique_event_nothrow m_hSelectedProfileKSEventSentToDriver;
     std::optional<bool> m_isProfileDDISupportedInBaseDriver;
-    std::optional<bool> m_isFaceAuthMode;
+    SENSORPROFILEID m_selectedProfileId;
 
     HRESULT ProfilePropertyHandler(
         _In_reads_bytes_(ulPropertyLength) PKSPROPERTY pProperty,
